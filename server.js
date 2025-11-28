@@ -3,8 +3,8 @@ const http = require('http');
 const socketIo = require('socket.io');
 const mongoose = require('mongoose');
 const cors = require('cors');
-const bcrypt = require('bcryptjs'); // THÊM DÒNG NÀY
-const jwt = require('jsonwebtoken'); // THÊM DÒNG NÀY
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
 require('dotenv').config();
 
 const app = express();
@@ -28,10 +28,10 @@ mongoose.connect(MONGODB_URI)
 .then(() => console.log('✅ Connected to MongoDB'))
 .catch(err => console.error('❌ MongoDB connection error:', err));
 
-// Schema User - THÊM PASSWORD
+// Schema User
 const userSchema = new mongoose.Schema({
   username: { type: String, unique: true, required: true },
-  password: { type: String, required: true }, // THÊM DÒNG NÀY
+  password: { type: String, required: true },
   publicKey: String,
   createdAt: { type: Date, default: Date.now }
 });
@@ -46,6 +46,9 @@ const messageSchema = new mongoose.Schema({
 
 const User = mongoose.model('User', userSchema);
 const Message = mongoose.model('Message', messageSchema);
+
+// Store connected users
+const connectedUsers = new Map();
 
 // ==================== API ROUTES ====================
 
@@ -63,14 +66,21 @@ app.get('/health', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     message: '🚀 Welcome to ChatNET Backend!',
-    version: '1.0.0'
+    version: '1.0.0',
+    endpoints: [
+      'POST /api/register - User registration',
+      'POST /api/login - User login',
+      'GET /api/users - Get all users',
+      'GET /api/messages - Get messages between users',
+      'POST /api/messages - Send message'
+    ]
   });
 });
 
-// 🔐 REGISTER ENDPOINT - THÊM API NÀY
+// 🔐 REGISTER ENDPOINT
 app.post('/api/register', async (req, res) => {
   try {
-    const { username, password } = req.body;
+    const { username, password, publicKey } = req.body;
 
     // Validate input
     if (!username || !password) {
@@ -95,7 +105,8 @@ app.post('/api/register', async (req, res) => {
     // Create user
     const user = new User({
       username,
-      password: hashedPassword
+      password: hashedPassword,
+      publicKey: publicKey || ''
     });
 
     await user.save();
@@ -103,6 +114,7 @@ app.post('/api/register', async (req, res) => {
     res.status(201).json({
       success: true,
       message: 'User registered successfully',
+      userId: user._id,
       user: { id: user._id, username: user.username }
     });
 
@@ -115,7 +127,7 @@ app.post('/api/register', async (req, res) => {
   }
 });
 
-// 🔐 LOGIN ENDPOINT - THÊM API NÀY
+// 🔐 LOGIN ENDPOINT
 app.post('/api/login', async (req, res) => {
   try {
     const { username, password } = req.body;
@@ -169,13 +181,27 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-// 👥 GET USERS ENDPOINT - THÊM API NÀY
+// 👥 GET USERS ENDPOINT
 app.get('/api/users', async (req, res) => {
   try {
-    const users = await User.find({}, 'username createdAt');
+    const { exclude } = req.query;
+    let query = {};
+    
+    if (exclude) {
+      query.username = { $ne: exclude };
+    }
+    
+    const users = await User.find(query, 'username createdAt publicKey')
+      .sort({ createdAt: -1 });
+
     res.json({
       success: true,
-      users
+      users: users.map(user => ({
+        id: user._id,
+        username: user.username,
+        publicKey: user.publicKey,
+        createdAt: user.createdAt
+      }))
     });
   } catch (error) {
     console.error('Get users error:', error);
@@ -186,17 +212,169 @@ app.get('/api/users', async (req, res) => {
   }
 });
 
-// Socket.io Connection
+// 💬 GET MESSAGES BETWEEN TWO USERS
+app.get('/api/messages', async (req, res) => {
+  try {
+    const { user1, user2 } = req.query;
+    
+    if (!user1 || !user2) {
+      return res.status(400).json({
+        success: false,
+        message: 'Both users are required'
+      });
+    }
+    
+    const messages = await Message.find({
+      $or: [
+        { sender: user1, receiver: user2 },
+        { sender: user2, receiver: user1 }
+      ]
+    }).sort({ timestamp: 1 });
+    
+    res.json({
+      success: true,
+      messages: messages.map(msg => ({
+        _id: msg._id,
+        sender: msg.sender,
+        receiver: msg.receiver,
+        encryptedMessage: msg.encryptedMessage,
+        timestamp: msg.timestamp
+      }))
+    });
+  } catch (error) {
+    console.error('Get messages error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Internal server error' 
+    });
+  }
+});
+
+// 📨 SEND MESSAGE (HTTP API)
+app.post('/api/messages', async (req, res) => {
+  try {
+    const { sender, receiver, encryptedMessage } = req.body;
+    
+    if (!sender || !receiver || !encryptedMessage) {
+      return res.status(400).json({
+        success: false,
+        message: 'Sender, receiver and message are required'
+      });
+    }
+    
+    const message = new Message({
+      sender,
+      receiver,
+      encryptedMessage,
+      timestamp: new Date()
+    });
+    
+    await message.save();
+
+    // Notify receiver via socket if online
+    const receiverSocketId = connectedUsers.get(receiver);
+    if (receiverSocketId) {
+      io.to(receiverSocketId).emit('new_message', {
+        _id: message._id,
+        sender,
+        receiver,
+        encryptedMessage,
+        timestamp: message.timestamp
+      });
+    }
+    
+    res.json({
+      success: true,
+      message: 'Message sent successfully',
+      messageId: message._id
+    });
+  } catch (error) {
+    console.error('Send message error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Internal server error' 
+    });
+  }
+});
+
+// ==================== SOCKET.IO HANDLERS ====================
+
 io.on('connection', (socket) => {
   console.log('🔗 User connected:', socket.id);
 
-  socket.on('join', (userId) => {
-    socket.join(userId);
-    console.log(`👤 User ${userId} joined room`);
+  // User joins their personal room
+  socket.on('join', (username) => {
+    socket.join(username);
+    connectedUsers.set(username, socket.id);
+    console.log(`👤 User ${username} joined room`);
+    
+    // Broadcast to others that this user is online
+    socket.broadcast.emit('user_online', username);
   });
 
+  // Handle sending messages via socket
+  socket.on('send_message', async (data) => {
+    try {
+      const { sender, receiver, encryptedMessage } = data;
+      
+      console.log(`📨 Message from ${sender} to ${receiver}`);
+      
+      // Save to database
+      const message = new Message({
+        sender,
+        receiver,
+        encryptedMessage,
+        timestamp: new Date()
+      });
+      
+      await message.save();
+      
+      // Send to receiver if online
+      const receiverSocketId = connectedUsers.get(receiver);
+      if (receiverSocketId) {
+        io.to(receiverSocketId).emit('new_message', {
+          _id: message._id,
+          sender,
+          receiver,
+          encryptedMessage,
+          timestamp: message.timestamp
+        });
+      }
+      
+      // Send confirmation to sender
+      socket.emit('message_sent', { success: true, messageId: message._id });
+      
+    } catch (error) {
+      console.error('Error sending message:', error);
+      socket.emit('message_sent', { success: false, error: error.message });
+    }
+  });
+
+  // Handle user typing
+  socket.on('typing', (data) => {
+    const receiverSocketId = connectedUsers.get(data.receiver);
+    if (receiverSocketId) {
+      io.to(receiverSocketId).emit('user_typing', {
+        sender: data.sender,
+        isTyping: data.isTyping
+      });
+    }
+  });
+
+  // Handle disconnect
   socket.on('disconnect', () => {
     console.log('🔴 User disconnected:', socket.id);
+    
+    // Remove from connected users
+    for (let [username, socketId] of connectedUsers.entries()) {
+      if (socketId === socket.id) {
+        connectedUsers.delete(username);
+        // Broadcast that user went offline
+        io.emit('user_offline', username);
+        console.log(`👤 User ${username} went offline`);
+        break;
+      }
+    }
   });
 });
 
@@ -209,4 +387,7 @@ server.listen(PORT, () => {
   console.log(`   POST /api/register - User registration`);
   console.log(`   POST /api/login - User login`);
   console.log(`   GET /api/users - Get all users`);
+  console.log(`   GET /api/messages - Get messages between users`);
+  console.log(`   POST /api/messages - Send message`);
+  console.log(`🔌 Socket.io events: join, send_message, typing`);
 });
