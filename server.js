@@ -526,6 +526,8 @@ app.get('/api/friends/:username', async (req, res) => {
 });
 // ==================== SOCKET.IO HANDLERS ====================
 
+// ==================== SOCKET.IO HANDLERS ====================
+
 io.on('connection', (socket) => {
   console.log('🔗 User connected:', socket.id);
 
@@ -577,6 +579,143 @@ io.on('connection', (socket) => {
     }
   });
 
+  // ==================== FRIEND REQUEST SOCKET EVENTS ====================
+
+  // Listen for new friend requests
+  socket.on('send_friend_request', async (data) => {
+    try {
+      const { fromUsername, toUsername } = data;
+      
+      console.log(`📩 Friend request from ${fromUsername} to ${toUsername}`);
+      
+      // Check if user exists
+      const toUser = await User.findOne({ username: toUsername });
+      if (!toUser) {
+        socket.emit('friend_request_error', { error: 'User not found' });
+        return;
+      }
+
+      // Check if request already exists
+      const existingRequest = await Friend.findOne({
+        userId: fromUsername,
+        friendUsername: toUsername
+      });
+      
+      if (existingRequest) {
+        socket.emit('friend_request_error', { 
+          error: existingRequest.status === 'pending' 
+            ? 'Friend request already sent' 
+            : 'Already friends' 
+        });
+        return;
+      }
+
+      // Create friend request
+      const friendRequest = new Friend({
+        userId: fromUsername,
+        friendUsername: toUsername,
+        friendId: toUser._id,
+        status: 'pending'
+      });
+
+      await friendRequest.save();
+
+      // Notify the receiver if online
+      const receiverSocketId = connectedUsers.get(toUsername);
+      if (receiverSocketId) {
+        io.to(receiverSocketId).emit('new_friend_request', {
+          _id: friendRequest._id,
+          fromUsername: fromUsername,
+          toUsername: toUsername,
+          createdAt: friendRequest.createdAt
+        });
+        
+        console.log(`✅ Notified ${toUsername} about new friend request`);
+      }
+
+      // Send confirmation to sender
+      socket.emit('friend_request_sent', { 
+        success: true, 
+        requestId: friendRequest._id 
+      });
+
+    } catch (error) {
+      console.error('Socket friend request error:', error);
+      socket.emit('friend_request_error', { error: 'Internal server error' });
+    }
+  });
+
+  // Listen for friend request responses
+  socket.on('respond_friend_request', async (data) => {
+    try {
+      const { requestId, response, currentUser } = data;
+      
+      console.log(`🔄 Friend request response:`, { requestId, response, currentUser });
+
+      const friendRequest = await Friend.findById(requestId);
+      
+      if (!friendRequest) {
+        socket.emit('friend_response_error', { error: 'Friend request not found' });
+        return;
+      }
+
+      if (friendRequest.status !== 'pending') {
+        socket.emit('friend_response_error', { error: 'Friend request already processed' });
+        return;
+      }
+
+      if (response === 'accepted') {
+        friendRequest.status = 'accepted';
+        await friendRequest.save();
+        
+        // Notify both users about new friendship
+        const senderSocketId = connectedUsers.get(friendRequest.userId);
+        const receiverSocketId = connectedUsers.get(friendRequest.friendUsername);
+        
+        if (senderSocketId) {
+          io.to(senderSocketId).emit('friend_request_accepted', {
+            requestId: friendRequest._id,
+            friendUsername: friendRequest.friendUsername
+          });
+        }
+        
+        if (receiverSocketId) {
+          io.to(receiverSocketId).emit('friend_request_accepted', {
+            requestId: friendRequest._id,
+            friendUsername: friendRequest.userId
+          });
+        }
+        
+        socket.emit('friend_response_success', { 
+          success: true, 
+          message: 'Friend request accepted' 
+        });
+        
+      } else {
+        // Rejected - remove the request
+        await Friend.findByIdAndDelete(requestId);
+        
+        // Notify the sender about rejection
+        const senderSocketId = connectedUsers.get(friendRequest.userId);
+        if (senderSocketId) {
+          io.to(senderSocketId).emit('friend_request_rejected', {
+            requestId: friendRequest._id,
+            byUsername: currentUser
+          });
+        }
+        
+        socket.emit('friend_response_success', { 
+          success: true, 
+          message: 'Friend request rejected' 
+        });
+      }
+
+    } catch (error) {
+      console.error('Socket friend response error:', error);
+      socket.emit('friend_response_error', { error: 'Internal server error' });
+    }
+  });
+
   // Handle user typing
   socket.on('typing', (data) => {
     const receiverSocketId = connectedUsers.get(data.receiver);
@@ -604,7 +743,6 @@ io.on('connection', (socket) => {
     }
   });
 });
-
 
 
 // Start server
