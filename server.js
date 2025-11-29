@@ -312,38 +312,41 @@ app.post('/api/messages', async (req, res) => {
 // ==================== FRIEND SYSTEM APIs ====================
 
 // 👥 ADD FRIEND
-app.post('/api/friends/add', async (req, res) => {
-  try {
-    const { userId, friendUsername } = req.body;
+// ==================== FRIEND SYSTEM APIs (NEW ENDPOINTS) ====================
 
-    if (!userId || !friendUsername) {
+// 📩 SEND FRIEND REQUEST (new endpoint)
+app.post('/api/friend-requests/send', async (req, res) => {
+  try {
+    const { fromUsername, toUsername } = req.body;
+
+    if (!fromUsername || !toUsername) {
       return res.status(400).json({
         success: false,
-        message: 'User ID and friend username are required'
+        message: 'fromUsername and toUsername are required'
       });
     }
 
     // Cannot add yourself
-    if (userId === friendUsername) {
+    if (fromUsername === toUsername) {
       return res.status(400).json({
         success: false,
-        message: 'Cannot add yourself as friend'
+        message: 'Cannot send friend request to yourself'
       });
     }
 
     // Check if user exists
-    const friendUser = await User.findOne({ username: friendUsername });
-    if (!friendUser) {
+    const toUser = await User.findOne({ username: toUsername });
+    if (!toUser) {
       return res.status(404).json({
         success: false,
         message: 'User not found'
       });
     }
 
-    // Check if already friends
+    // Check if already friends or request exists
     const existingFriend = await Friend.findOne({ 
-      userId, 
-      friendUsername 
+      userId: fromUsername, 
+      friendUsername: toUsername 
     });
     
     if (existingFriend) {
@@ -355,24 +358,38 @@ app.post('/api/friends/add', async (req, res) => {
       });
     }
 
-    // Create friend request
-    const friend = new Friend({
-      userId,
-      friendUsername,
-      friendId: friendUser._id,
+    // Check if reverse request exists
+    const reverseRequest = await Friend.findOne({
+      userId: toUsername,
+      friendUsername: fromUsername,
       status: 'pending'
     });
 
-    await friend.save();
+    if (reverseRequest) {
+      return res.status(400).json({
+        success: false,
+        message: 'This user has already sent you a friend request'
+      });
+    }
+
+    // Create friend request
+    const friendRequest = new Friend({
+      userId: fromUsername,
+      friendUsername: toUsername,
+      friendId: toUser._id,
+      status: 'pending'
+    });
+
+    await friendRequest.save();
 
     res.json({
       success: true,
       message: 'Friend request sent successfully',
-      friendRequest: friend
+      requestId: friendRequest._id
     });
 
   } catch (error) {
-    console.error('Add friend error:', error);
+    console.error('Send friend request error:', error);
     res.status(500).json({ 
       success: false, 
       message: 'Internal server error' 
@@ -380,21 +397,28 @@ app.post('/api/friends/add', async (req, res) => {
   }
 });
 
-// 👥 ACCEPT FRIEND REQUEST
-app.post('/api/friends/accept', async (req, res) => {
+// 📩 RESPOND TO FRIEND REQUEST (new endpoint)
+app.post('/api/friend-requests/respond', async (req, res) => {
   try {
-    const { userId, friendUsername } = req.body;
+    const { requestId, response } = req.body;
 
-    const friendRequest = await Friend.findOneAndUpdate(
-      { 
-        friendUsername: userId, // Current user is the receiver
-        userId: friendUsername, // The one who sent request
-        status: 'pending'
-      },
-      { status: 'accepted' },
-      { new: true }
-    );
+    if (!requestId || !response) {
+      return res.status(400).json({
+        success: false,
+        message: 'requestId and response are required'
+      });
+    }
 
+    const validResponses = ['accepted', 'rejected'];
+    if (!validResponses.includes(response)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Response must be "accepted" or "rejected"'
+      });
+    }
+
+    const friendRequest = await Friend.findById(requestId);
+    
     if (!friendRequest) {
       return res.status(404).json({
         success: false,
@@ -402,14 +426,34 @@ app.post('/api/friends/accept', async (req, res) => {
       });
     }
 
-    res.json({
-      success: true,
-      message: 'Friend request accepted',
-      friend: friendRequest
-    });
+    if (friendRequest.status !== 'pending') {
+      return res.status(400).json({
+        success: false,
+        message: 'Friend request already processed'
+      });
+    }
+
+    if (response === 'accepted') {
+      friendRequest.status = 'accepted';
+      await friendRequest.save();
+      
+      res.json({
+        success: true,
+        message: 'Friend request accepted',
+        friend: friendRequest
+      });
+    } else {
+      // Remove the request if rejected
+      await Friend.findByIdAndDelete(requestId);
+      
+      res.json({
+        success: true,
+        message: 'Friend request rejected'
+      });
+    }
 
   } catch (error) {
-    console.error('Accept friend error:', error);
+    console.error('Respond to friend request error:', error);
     res.status(500).json({ 
       success: false, 
       message: 'Internal server error' 
@@ -417,55 +461,63 @@ app.post('/api/friends/accept', async (req, res) => {
   }
 });
 
-// 👥 GET FRIENDS LIST
-app.get('/api/friends/:userId', async (req, res) => {
-  try {
-    const { userId } = req.params;
-
-    const friends = await Friend.find({ 
-      userId, 
-      status: 'accepted' 
-    }).populate('friendId', 'username createdAt');
-
-    res.json({
-      success: true,
-      friends: friends.map(friend => ({
-        id: friend.friendId._id,
-        username: friend.friendUsername,
-        createdAt: friend.createdAt
-      }))
-    });
-
-  } catch (error) {
-    console.error('Get friends error:', error);
-    res.status(500).json({ 
-      success: false, 
-      message: 'Internal server error' 
-    });
-  }
-});
-
-// 👥 GET PENDING REQUESTS
-app.get('/api/friends/pending/:username', async (req, res) => {
+// 📩 GET PENDING FRIEND REQUESTS (new endpoint)
+app.get('/api/friend-requests/pending/:username', async (req, res) => {
   try {
     const { username } = req.params;
 
     const pendingRequests = await Friend.find({ 
       friendUsername: username,
       status: 'pending' 
-    }).populate('userId', 'username');
+    }).sort({ createdAt: -1 });
 
     res.json({
       success: true,
       pendingRequests: pendingRequests.map(request => ({
-        id: request._id,
-        fromUser: request.userId.username,
+        _id: request._id,
+        fromUsername: request.userId,
+        toUsername: request.friendUsername,
         createdAt: request.createdAt
       }))
     });
 
   } catch (error) {
     console.error('Get pending requests error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Internal server error' 
+    });
+  }
+});
+
+// 👥 GET FRIENDS LIST (updated endpoint)
+app.get('/api/friends/:username', async (req, res) => {
+  try {
+    const { username } = req.params;
+
+    const friends = await Friend.find({ 
+      $or: [
+        { userId: username, status: 'accepted' },
+        { friendUsername: username, status: 'accepted' }
+      ]
+    }).sort({ createdAt: -1 });
+
+    const friendList = friends.map(friend => {
+      const friendUsername = friend.userId === username ? friend.friendUsername : friend.userId;
+      return {
+        id: friend._id,
+        username: friendUsername,
+        createdAt: friend.createdAt
+      };
+    });
+
+    res.json({
+      success: true,
+      friends: friendList
+    });
+
+  } catch (error) {
+    console.error('Get friends error:', error);
     res.status(500).json({ 
       success: false, 
       message: 'Internal server error' 
@@ -553,6 +605,8 @@ io.on('connection', (socket) => {
   });
 });
 
+
+
 // Start server
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
@@ -564,5 +618,9 @@ server.listen(PORT, () => {
   console.log(`   GET /api/users - Get all users`);
   console.log(`   GET /api/messages - Get messages between users`);
   console.log(`   POST /api/messages - Send message`);
+  console.log(`   POST /api/friend-requests/send - Send friend request`);
+  console.log(`   POST /api/friend-requests/respond - Respond to friend request`);
+  console.log(`   GET /api/friend-requests/pending/:username - Get pending requests`);
+  console.log(`   GET /api/friends/:username - Get friends list`);
   console.log(`🔌 Socket.io events: join, send_message, typing`);
 });
