@@ -23,11 +23,17 @@ app.use(cors());
 app.use(express.json());
 
 // Kết nối MongoDB
+
 const MONGODB_URI = process.env.MONGODB_URI;
+console.log('🔄 Connecting to MongoDB...');
+console.log('📝 MongoDB URI:', MONGODB_URI ? '✅ Provided' : '❌ Missing');
+
 mongoose.connect(MONGODB_URI)
 .then(() => console.log('✅ Connected to MongoDB'))
-.catch(err => console.error('❌ MongoDB connection error:', err));
-
+.catch(err => {
+  console.error('❌ MongoDB connection error:', err);
+  console.error('💡 Check your MONGODB_URI in .env file');
+});
 // Schema User
 const userSchema = new mongoose.Schema({
   username: { type: String, unique: true, required: true },
